@@ -35,5 +35,23 @@ export function dueDateForBill(monthKey: string, dueDay: number): string {
 function clampDay(day: number): number {
   if (day < 1) return 1;
   if (day > 28) return 28; // evita estouro em fevereiro (simplificação)
-  return day;
+  // ✅ simplificação proposital para evitar dias inexistentes (29/30/31)
+  return Math.min(Math.max(1, day), 28);
+}
+
+// ✅ NOVO:
+// Para garantir que uma cobrança recorrente no CARTÃO apareça no mês da FATURA (statementMonth),
+// precisamos escolher uma data de compra que gere statementMonth === monthKey.
+// Regra (igual ao seu computeStatementMonth):
+// - se chargeDay > closingDay => a compra precisa cair no mês ANTERIOR
+// - senão => a compra cai no próprio mêsKey
+export function chargeDateForStatementMonth(
+  statementMonthKey: string, // "YYYY-MM" (mês da fatura)
+  chargeDay: number,         // dia da cobrança/compra recorrente
+  closingDay: number         // dia de fechamento do cartão
+): string {
+  const base = parseISO(`${statementMonthKey}-01`);
+  const monthForPurchase = chargeDay > closingDay ? addMonths(base, -1) : base;
+  const d = setDate(monthForPurchase, clampDay(chargeDay));
+  return toISODate(d);
 }

@@ -1,6 +1,6 @@
 import { db } from '../db/db';
 import type { FixedBill, InstallmentPlan, Transaction, TxStatus } from '../domain/types';
-import { computeDueDate, computeStatementMonth, dueDateForBill } from '../lib/dates';
+import { computeDueDate, computeStatementMonth, dueDateForBill, chargeDateForStatementMonth } from '../lib/dates';
 
 export function uuid(): string {
   // bom o suficiente para app local
@@ -105,7 +105,7 @@ export async function addInstallmentPlan(plan: Omit<InstallmentPlan, 'id' | 'cre
     for (let i = 1; i <= plan.installments; i++) {
       const dateISO = shiftMonth(plan.purchaseDate, i - 1);
       const card = await db.cards.get(plan.cardId);
-      const statementMonth = card ? computeStatementMonth(dateISO, card.closingDay) : dateISO.slice(0,7);
+      const statementMonth = card ? computeStatementMonth(dateISO, card.closingDay) : dateISO.slice(0, 7);
       const dueDate = card ? computeDueDate(statementMonth, card.dueDay, card.dueOffsetMonths) : undefined;
 
       await db.transactions.add({
@@ -147,43 +147,75 @@ export async function setTransactionStatus(txId: string, status: TxStatus): Prom
 
 export async function ensureBillsForMonth(monthKey: string): Promise<void> {
   const bills = await db.fixedBills.toArray();
-  const activeBills = bills.filter(b => b.active);
+  const activeBills = bills.filter((b) => b.active);
 
   for (const b of activeBills) {
-    const dueDate = dueDateForBill(monthKey, b.dueDay);
+    // ✅ Evita duplicar: sempre checa se já existe um tx gerado para este mês (refMonth)
     const existing = await db.transactions
-      .where('refMonth').equals(monthKey)
-      .and(t => t.fixedBillId === b.id)
+      .where('refMonth')
+      .equals(monthKey)
+      .and((t) => t.fixedBillId === b.id)
       .first();
 
-    if (!existing) {
+    if (existing) continue;
+
+    // ✅ CARTÃO: gerar data de compra correta para cair no statementMonth == monthKey
+    if (b.method === 'cartao' && b.cardId) {
+      const card = await db.cards.get(b.cardId);
+      if (!card) continue;
+
+      const purchaseDate = chargeDateForStatementMonth(
+        monthKey,
+        b.dueDay,         // aqui passa a ser o "dia da cobrança/compra" recorrente
+        card.closingDay
+      );
+
       await addTransaction({
-        date: dueDate,
-        refMonth: monthKey,
+        // Não setamos refMonth: o addTransaction calcula e vai cair em monthKey corretamente
+        date: purchaseDate,
         description: b.name,
         categoryId: b.categoryId,
         type: b.type as any,
         method: b.method as any,
         amountCents: b.amountCents,
         status: 'pendente',
-        institution: b.institution,
-        cardId: b.method === 'cartao' ? b.cardId : undefined,
-        dueDate,
+        cardId: b.cardId,
         fixedBillId: b.id,
         notes: b.notes ?? '',
       });
+
+      continue;
     }
+
+    // ✅ NÃO-CARTÃO: vencimento dentro do próprio mês (competência)
+    const dueDate = dueDateForBill(monthKey, b.dueDay);
+
+    await addTransaction({
+      refMonth: monthKey,
+      date: dueDate, // “data” aqui é a data padrão que aparece se você não mexer
+      description: b.name,
+      categoryId: b.categoryId,
+      type: b.type as any,
+      method: b.method as any,
+      amountCents: b.amountCents,
+      status: 'pendente',
+      institution: b.institution,
+      dueDate,
+      fixedBillId: b.id,
+      notes: b.notes ?? '',
+    });
   }
 }
 
-function shiftMonth(dateISO: string, add: number): string {
-  const y = Number(dateISO.slice(0, 4));
-  const m = Number(dateISO.slice(5, 7));
-  const d = Number(dateISO.slice(8, 10));
-  const total = (y * 12 + (m - 1)) + add;
-  const ny = Math.floor(total / 12);
-  const nm = (total % 12) + 1;
-  const mm = String(nm).padStart(2, '0');
-  const dd = String(Math.min(d, 28)).padStart(2, '0');
-  return `${ny}-${mm}-${dd}`;
-}
+
+  function shiftMonth(dateISO: string, add: number): string {
+    const y = Number(dateISO.slice(0, 4));
+    const m = Number(dateISO.slice(5, 7));
+    const d = Number(dateISO.slice(8, 10));
+    const total = (y * 12 + (m - 1)) + add;
+    const ny = Math.floor(total / 12);
+    const nm = (total % 12) + 1;
+    const mm = String(nm).padStart(2, '0');
+    const dd = String(Math.min(d, 28)).padStart(2, '0');
+    return `${ny}-${mm}-${dd}`;
+  }

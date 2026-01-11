@@ -1,20 +1,31 @@
 import React, { useEffect, useMemo, useState, useId } from "react";
+import { format, parseISO } from "date-fns";
+
 import { db } from "../db/db";
 import { useLiveQuery } from "../hooks/useLiveQuery";
 import { Section } from "../ui/Section";
+
 import { brlToCents, centsToBrl, centsToBrlCompact } from "../lib/money";
+import { DEFAULT_INSTITUTIONS } from "../domain/institutions";
+
+import type {
+  FixedBill,
+  PaymentMethod,
+  Transaction,
+  TxType,
+} from "../domain/types";
+
 import {
   addInstallmentPlan,
   addTransaction,
   deleteTransaction,
   setTransactionStatus,
   updateTransaction,
+  uuid,
 } from "../services/finance";
-import { format, parseISO } from "date-fns";
-import { DEFAULT_INSTITUTIONS } from "../domain/institutions";
-import type { PaymentMethod, Transaction, TxType } from "../domain/types";
 
 type Toast = { kind: "success" | "error"; text: string };
+type TxPatch = Partial<Omit<Transaction, "id" | "createdAt">>;
 
 function cls(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
@@ -25,7 +36,17 @@ function toMonthKey(d: Date) {
   return `${d.getFullYear()}-${mm}`;
 }
 
-type TxPatch = Partial<Omit<Transaction, "id" | "createdAt">>;
+function clampDay28(n: number) {
+  if (!Number.isFinite(n)) return 1;
+  return Math.min(28, Math.max(1, Math.trunc(n)));
+}
+
+function dayFromISO(iso: string) {
+  // iso: YYYY-MM-DD
+  const d = parseISO(iso);
+  const day = d.getDate();
+  return clampDay28(day);
+}
 
 function ToastView({ toast }: { toast: Toast }) {
   return (
@@ -44,14 +65,81 @@ function ToastView({ toast }: { toast: Toast }) {
   );
 }
 
+async function upsertFixedBillFromForm(args: {
+  // chave “humana” para encontrar/evitar duplicados
+  name: string;
+  type: TxType;
+  method: PaymentMethod;
+  institution?: string;
+  cardId?: string;
+
+  // dados do template
+  amountCents: number;
+  dueDay: number;
+  categoryId?: string;
+  notes?: string;
+
+  // se já existir: atualizar ou não
+  updateIfExists: boolean;
+}): Promise<string> {
+  const normalizedName = args.name.trim().toLowerCase();
+  const normalizedInst = (args.institution ?? "").trim().toLowerCase();
+
+  const all = await db.fixedBills.toArray();
+
+  const existing = all.find((b) => {
+    const sameName = b.name.trim().toLowerCase() === normalizedName;
+    const sameType = b.type === args.type;
+    const sameMethod = b.method === args.method;
+    if (!sameName || !sameType || !sameMethod) return false;
+
+    if (args.method === "cartao")
+      return (b.cardId ?? "") === (args.cardId ?? "");
+    return (b.institution ?? "").trim().toLowerCase() === normalizedInst;
+  });
+
+  if (existing) {
+    if (args.updateIfExists) {
+      await db.fixedBills.update(existing.id, {
+        amountCents: args.amountCents,
+        dueDay: args.dueDay,
+        categoryId: args.categoryId,
+        notes: args.notes ?? "",
+        active: true,
+        // mantém coerência por método
+        institution: args.method === "cartao" ? undefined : args.institution,
+        cardId: args.method === "cartao" ? args.cardId : undefined,
+      });
+    }
+    return existing.id;
+  }
+
+  const id = uuid();
+  const bill: FixedBill = {
+    id,
+    type: args.type as any,
+    name: args.name.trim(),
+    amountCents: args.amountCents,
+    dueDay: args.dueDay,
+    method: args.method,
+    institution: args.method === "cartao" ? undefined : args.institution,
+    cardId: args.method === "cartao" ? args.cardId : undefined,
+    categoryId: args.categoryId,
+    active: true,
+    notes: args.notes ?? "",
+  };
+
+  await db.fixedBills.add(bill);
+  return id;
+}
+
 export function Lancamentos() {
-  const monthInputId = useId();
+  const baseId = useId();
 
   const [monthKey, setMonthKey] = useState(() => toMonthKey(new Date()));
   const todayISO = useMemo(() => new Date().toISOString().slice(0, 10), []);
 
   const [toast, setToast] = useState<Toast | null>(null);
-
   useEffect(() => {
     if (!toast) return;
     const t = window.setTimeout(() => setToast(null), 2200);
@@ -71,28 +159,36 @@ export function Lancamentos() {
       .where("refMonth")
       .equals(monthKey)
       .toArray();
-    // ordena por data (YYYY-MM-DD)
     return all.sort((a, b) => String(a.date).localeCompare(String(b.date)));
   }, [monthKey]);
 
   const [showAdvanced, setShowAdvanced] = useState(false);
+
+  // Parcelamento (somente cartão + despesa)
   const [isInstallment, setIsInstallment] = useState(false);
   const [installments, setInstallments] = useState(2);
   const [installmentMode, setInstallmentMode] = useState<
     "projetar_fatura" | "gerar_lancamentos"
   >("projetar_fatura");
 
+  // ✅ Recorrência (conta fixa)
+  const [makeRecurring, setMakeRecurring] = useState(false);
+  const [recurringDay, setRecurringDay] = useState<number>(() =>
+    clampDay28(new Date().getDate())
+  );
+  const [updateRecurringTemplate, setUpdateRecurringTemplate] = useState(true);
+
   const [form, setForm] = useState(() => ({
     refMonth: monthKey,
     date: todayISO,
     description: "",
-    categoryId: "", // sem pré-categoria
+    categoryId: "",
     type: "despesa" as TxType,
     method: "cartao" as PaymentMethod,
     institution: DEFAULT_INSTITUTIONS[0] ?? "",
     amount: "",
     status: "pendente" as const,
-    cardId: "", // sem pré-cartão
+    cardId: "",
     dueDate: "",
     notes: "",
   }));
@@ -104,7 +200,7 @@ export function Lancamentos() {
     }
   }, [monthKey, showAdvanced]);
 
-  // Se não há categoria selecionada, tenta escolher a primeira disponível
+  // Se não há categoria selecionada, escolhe a primeira disponível
   useEffect(() => {
     if (!form.categoryId && (cats?.length ?? 0) > 0) {
       setForm((f) => ({ ...f, categoryId: cats![0].id }));
@@ -120,13 +216,23 @@ export function Lancamentos() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [form.method, activeCards.length]);
 
+  // Se trocar para não-cartão, não faz sentido parcelado
+  useEffect(() => {
+    if (form.method !== "cartao") setIsInstallment(false);
+  }, [form.method]);
+
+  // Se trocar tipo para receita/transferência, parcelado não faz sentido
+  useEffect(() => {
+    if (form.type !== "despesa") setIsInstallment(false);
+  }, [form.type]);
+
   const showCard = form.method === "cartao";
   const showInstitution = form.method !== "cartao";
   const showDueManual =
     form.method !== "cartao" && form.type !== "transferencia";
 
-  // Parcelado só faz sentido para despesa no cartão
   const canUseInstallment = showCard && form.type === "despesa";
+  const canBeRecurring = form.type !== "transferencia";
 
   // Total do mês (saldo por competência)
   const total = useMemo(() => {
@@ -138,6 +244,7 @@ export function Lancamentos() {
   }, [txs]);
 
   const amountCents = useMemo(() => brlToCents(form.amount), [form.amount]);
+
   const canSubmit =
     !!amountCents &&
     amountCents > 0 &&
@@ -156,15 +263,21 @@ export function Lancamentos() {
       return;
     }
 
+    const desc = form.description.trim();
+
     try {
+      // 1) Parcelado (seu fluxo original)
       if (showCard && canUseInstallment && isInstallment && installments > 1) {
         await addInstallmentPlan({
           purchaseDate: form.date,
-          description: form.description.trim(),
+          description: desc,
           categoryId: form.categoryId || undefined,
           cardId: form.cardId,
           totalCents: amountCents,
-          installments,
+          installments:
+            clampDay28(installments) === installments
+              ? installments
+              : installments, // só evita NaN
           mode: installmentMode,
         });
 
@@ -172,27 +285,68 @@ export function Lancamentos() {
           kind: "success",
           text: "Parcelamento registrado com sucesso.",
         });
-      } else {
-        await addTransaction({
-          refMonth: form.refMonth,
-          date: form.date,
-          description: form.description.trim(),
-          categoryId: form.categoryId || undefined,
+
+        // limpa campos rápidos
+        setForm((f) => ({
+          ...f,
+          description: "",
+          amount: "",
+          notes: "",
+          dueDate: "",
+        }));
+        setIsInstallment(false);
+        setInstallments(2);
+        setInstallmentMode("projetar_fatura");
+        return;
+      }
+
+      // 2) Recorrente: cria/atualiza o template (FixedBill) e liga o lançamento a ele
+      let fixedBillId: string | undefined;
+
+      if (makeRecurring && canBeRecurring) {
+        const dueDay = clampDay28(recurringDay);
+
+        fixedBillId = await upsertFixedBillFromForm({
+          name: desc,
           type: form.type,
           method: form.method,
           institution: showInstitution ? form.institution : undefined,
-          amountCents,
-          status: form.status,
           cardId: showCard ? form.cardId : undefined,
-          dueDate: showDueManual && form.dueDate ? form.dueDate : undefined,
+          amountCents,
+          dueDay,
+          categoryId: form.categoryId || undefined,
           notes: form.notes || "",
-          projected: false,
+          updateIfExists: updateRecurringTemplate,
         });
-
-        setToast({ kind: "success", text: "Lançamento adicionado." });
       }
 
-      // limpa campos “rápidos”
+      // 3) Normal (com ou sem fixedBillId)
+      await addTransaction({
+        refMonth: form.refMonth,
+        date: form.date,
+        description: desc,
+        categoryId: form.categoryId || undefined,
+        type: form.type,
+        method: form.method,
+        institution: showInstitution ? form.institution : undefined,
+        amountCents,
+        status: form.status,
+        cardId: showCard ? form.cardId : undefined,
+        dueDate: showDueManual && form.dueDate ? form.dueDate : undefined,
+        notes: form.notes || "",
+        projected: false,
+        fixedBillId, // ✅ se marcado como recorrente, liga ao template
+      });
+
+      setToast({
+        kind: "success",
+        text:
+          makeRecurring && canBeRecurring
+            ? "Recorrência criada e lançamento adicionado."
+            : "Lançamento adicionado.",
+      });
+
+      // limpa campos rápidos
       setForm((f) => ({
         ...f,
         description: "",
@@ -200,9 +354,9 @@ export function Lancamentos() {
         notes: "",
         dueDate: "",
       }));
-      setIsInstallment(false);
-      setInstallments(2);
-      setInstallmentMode("projetar_fatura");
+
+      // opcional: manter recorrente ligado ou não? (aqui desliga para evitar “surpresas”)
+      setMakeRecurring(false);
     } catch {
       setToast({ kind: "error", text: "Falha ao salvar. Tente novamente." });
     }
@@ -219,11 +373,11 @@ export function Lancamentos() {
         subtitle="Use o mês como competência e registre a data real do pagamento/compra."
         right={
           <div className="flex items-center gap-2">
-            <label className="sr-only" htmlFor={monthInputId}>
+            <label className="sr-only" htmlFor={`${baseId}-month`}>
               Selecione o mês (competência)
             </label>
             <input
-              id={monthInputId}
+              id={`${baseId}-month`}
               className="input w-[140px]"
               type="month"
               value={monthKey}
@@ -269,11 +423,14 @@ export function Lancamentos() {
             </div>
 
             <div className="md:col-span-2">
-              <label className="text-xs text-slate-300" htmlFor="tx-amount">
+              <label
+                className="text-xs text-slate-300"
+                htmlFor={`${baseId}-amount`}
+              >
                 Valor (R$)
               </label>
               <input
-                id="tx-amount"
+                id={`${baseId}-amount`}
                 className="input mt-1 text-lg"
                 inputMode="decimal"
                 placeholder="Ex.: 123,45"
@@ -286,11 +443,14 @@ export function Lancamentos() {
             </div>
 
             <div className="md:col-span-2">
-              <label className="text-xs text-slate-300" htmlFor="tx-method">
+              <label
+                className="text-xs text-slate-300"
+                htmlFor={`${baseId}-method`}
+              >
                 Meio
               </label>
               <select
-                id="tx-method"
+                id={`${baseId}-method`}
                 className="select mt-1"
                 value={form.method}
                 onChange={(e) => {
@@ -309,11 +469,14 @@ export function Lancamentos() {
             </div>
 
             <div className="md:col-span-4">
-              <label className="text-xs text-slate-300" htmlFor="tx-desc">
+              <label
+                className="text-xs text-slate-300"
+                htmlFor={`${baseId}-desc`}
+              >
                 Descrição
               </label>
               <input
-                id="tx-desc"
+                id={`${baseId}-desc`}
                 className="input mt-1"
                 placeholder="Ex.: mercado, gasolina, internet…"
                 value={form.description}
@@ -325,11 +488,14 @@ export function Lancamentos() {
             </div>
 
             <div className="md:col-span-2">
-              <label className="text-xs text-slate-300" htmlFor="tx-cat">
+              <label
+                className="text-xs text-slate-300"
+                htmlFor={`${baseId}-cat`}
+              >
                 Categoria
               </label>
               <select
-                id="tx-cat"
+                id={`${baseId}-cat`}
                 className="select mt-1"
                 value={form.categoryId}
                 onChange={(e) =>
@@ -350,11 +516,14 @@ export function Lancamentos() {
 
             {showCard ? (
               <div className="md:col-span-3">
-                <label className="text-xs text-slate-300" htmlFor="tx-card">
+                <label
+                  className="text-xs text-slate-300"
+                  htmlFor={`${baseId}-card`}
+                >
                   Cartão
                 </label>
                 <select
-                  id="tx-card"
+                  id={`${baseId}-card`}
                   className="select mt-1"
                   value={form.cardId}
                   onChange={(e) =>
@@ -375,11 +544,14 @@ export function Lancamentos() {
               </div>
             ) : (
               <div className="md:col-span-3">
-                <label className="text-xs text-slate-300" htmlFor="tx-inst">
+                <label
+                  className="text-xs text-slate-300"
+                  htmlFor={`${baseId}-inst`}
+                >
                   Banco / Instituição
                 </label>
                 <select
-                  id="tx-inst"
+                  id={`${baseId}-inst`}
                   className="select mt-1"
                   value={form.institution}
                   onChange={(e) =>
@@ -397,11 +569,14 @@ export function Lancamentos() {
             )}
 
             <div className="md:col-span-3">
-              <label className="text-xs text-slate-300" htmlFor="tx-date">
+              <label
+                className="text-xs text-slate-300"
+                htmlFor={`${baseId}-date`}
+              >
                 Data (pagamento/compra)
               </label>
               <input
-                id="tx-date"
+                id={`${baseId}-date`}
                 className="input mt-1"
                 type="date"
                 value={form.date}
@@ -412,67 +587,132 @@ export function Lancamentos() {
               />
             </div>
 
-            {showCard ? (
-              <div className="md:col-span-6 flex flex-wrap items-center gap-3">
-                <label
-                  className={cls(
-                    "inline-flex items-center gap-2 text-sm",
-                    !canUseInstallment && "opacity-60"
-                  )}
-                >
-                  <input
-                    type="checkbox"
-                    checked={canUseInstallment ? isInstallment : false}
-                    disabled={!canUseInstallment}
-                    onChange={(e) => setIsInstallment(e.target.checked)}
-                  />
-                  Parcelado
-                </label>
+            {/* ✅ Linha de “opções” (recorrente e parcelado) */}
+            <div className="md:col-span-6 flex flex-wrap items-center gap-3">
+              <label
+                className={cls(
+                  "inline-flex items-center gap-2 text-sm",
+                  !canBeRecurring && "opacity-60"
+                )}
+              >
+                <input
+                  type="checkbox"
+                  checked={canBeRecurring ? makeRecurring : false}
+                  disabled={!canBeRecurring}
+                  onChange={(e) => setMakeRecurring(e.target.checked)}
+                />
+                Recorrente (conta fixa)
+              </label>
 
-                {canUseInstallment && isInstallment ? (
-                  <>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs text-slate-300">Parcelas</span>
-                      <input
-                        className="input w-[90px]"
-                        type="number"
-                        min={2}
-                        max={48}
-                        value={installments}
-                        onChange={(e) =>
-                          setInstallments(Number(e.target.value || 2))
-                        }
-                        aria-label="Número de parcelas"
-                      />
-                    </div>
-
-                    <label className="sr-only" htmlFor="tx-install-mode">
-                      Modo de parcelamento
-                    </label>
-                    <select
-                      id="tx-install-mode"
-                      className="select"
-                      value={installmentMode}
-                      onChange={(e) =>
-                        setInstallmentMode(e.target.value as any)
-                      }
-                      aria-label="Modo de parcelamento"
-                    >
-                      <option value="projetar_fatura">
-                        Projetar na fatura
-                      </option>
-                      <option value="gerar_lancamentos">
-                        Gerar lançamentos
-                      </option>
-                    </select>
-
-                    <span className="text-xs text-slate-400">
-                      * “Projetar” = aparece na fatura sem poluir o dia a dia.
+              {makeRecurring && canBeRecurring ? (
+                <>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-slate-300">
+                      {showCard ? "Dia da cobrança" : "Dia do vencimento"}
                     </span>
-                  </>
-                ) : null}
-              </div>
-            ) : null}
+                    <input
+                      className="input w-[90px]"
+                      type="number"
+                      min={1}
+                      max={28}
+                      value={recurringDay}
+                      onChange={(e) =>
+                        setRecurringDay(Number(e.target.value || 1))
+                      }
+                      aria-label={
+                        showCard ? "Dia da cobrança" : "Dia do vencimento"
+                      }
+                    />
+                  </div>
+
+                  <label className="inline-flex items-center gap-2 text-xs text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={updateRecurringTemplate}
+                      onChange={(e) =>
+                        setUpdateRecurringTemplate(e.target.checked)
+                      }
+                    />
+                    Atualizar valor padrão (próximos meses)
+                  </label>
+
+                  <span className="text-xs text-slate-400">
+                    * A recorrência aparece nos próximos meses via “Contas
+                    fixas”.
+                  </span>
+                </>
+              ) : null}
+
+              {showCard ? (
+                <>
+                  <span
+                    className="mx-2 h-5 w-px bg-slate-800"
+                    aria-hidden="true"
+                  />
+
+                  <label
+                    className={cls(
+                      "inline-flex items-center gap-2 text-sm",
+                      !canUseInstallment && "opacity-60"
+                    )}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={canUseInstallment ? isInstallment : false}
+                      disabled={!canUseInstallment}
+                      onChange={(e) => setIsInstallment(e.target.checked)}
+                    />
+                    Parcelado
+                  </label>
+
+                  {canUseInstallment && isInstallment ? (
+                    <>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs text-slate-300">Parcelas</span>
+                        <input
+                          className="input w-[90px]"
+                          type="number"
+                          min={2}
+                          max={48}
+                          value={installments}
+                          onChange={(e) =>
+                            setInstallments(Number(e.target.value || 2))
+                          }
+                          aria-label="Número de parcelas"
+                        />
+                      </div>
+
+                      <label
+                        className="sr-only"
+                        htmlFor={`${baseId}-install-mode`}
+                      >
+                        Modo de parcelamento
+                      </label>
+                      <select
+                        id={`${baseId}-install-mode`}
+                        className="select"
+                        value={installmentMode}
+                        onChange={(e) =>
+                          setInstallmentMode(e.target.value as any)
+                        }
+                        aria-label="Modo de parcelamento"
+                      >
+                        <option value="projetar_fatura">
+                          Projetar na fatura
+                        </option>
+                        <option value="gerar_lancamentos">
+                          Gerar lançamentos
+                        </option>
+                      </select>
+
+                      <span className="text-xs text-slate-400">
+                        * “Projetar” = aparece na fatura sem poluir o dia a dia.
+                      </span>
+                    </>
+                  ) : null}
+                </>
+              ) : null}
+            </div>
           </div>
 
           <div className="flex items-center justify-between">
@@ -493,11 +733,14 @@ export function Lancamentos() {
           {showAdvanced ? (
             <div className="grid md:grid-cols-6 gap-3">
               <div className="md:col-span-2">
-                <label className="text-xs text-slate-300" htmlFor="tx-refMonth">
+                <label
+                  className="text-xs text-slate-300"
+                  htmlFor={`${baseId}-refMonth`}
+                >
                   Competência (mês)
                 </label>
                 <input
-                  id="tx-refMonth"
+                  id={`${baseId}-refMonth`}
                   className="input mt-1"
                   type="month"
                   value={form.refMonth}
@@ -510,11 +753,14 @@ export function Lancamentos() {
 
               {showDueManual ? (
                 <div className="md:col-span-2">
-                  <label className="text-xs text-slate-300" htmlFor="tx-due">
+                  <label
+                    className="text-xs text-slate-300"
+                    htmlFor={`${baseId}-due`}
+                  >
                     Vencimento (opcional)
                   </label>
                   <input
-                    id="tx-due"
+                    id={`${baseId}-due`}
                     className="input mt-1"
                     type="date"
                     value={form.dueDate}
@@ -529,11 +775,14 @@ export function Lancamentos() {
               )}
 
               <div className="md:col-span-2">
-                <label className="text-xs text-slate-300" htmlFor="tx-status">
+                <label
+                  className="text-xs text-slate-300"
+                  htmlFor={`${baseId}-status`}
+                >
                   Status
                 </label>
                 <select
-                  id="tx-status"
+                  id={`${baseId}-status`}
                   className="select mt-1"
                   value={form.status}
                   onChange={(e) =>
@@ -547,11 +796,14 @@ export function Lancamentos() {
               </div>
 
               <div className="md:col-span-6">
-                <label className="text-xs text-slate-300" htmlFor="tx-notes">
+                <label
+                  className="text-xs text-slate-300"
+                  htmlFor={`${baseId}-notes`}
+                >
                   Observações (opcional)
                 </label>
                 <input
-                  id="tx-notes"
+                  id={`${baseId}-notes`}
                   className="input mt-1"
                   placeholder="Ex.: pago via app, reembolso, etc."
                   value={form.notes}
@@ -593,6 +845,10 @@ export function Lancamentos() {
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="badge">{tx.type}</span>
                     <span className="badge">{tx.method}</span>
+
+                    {tx.fixedBillId ? (
+                      <span className="badge">recorrente</span>
+                    ) : null}
 
                     {tx.institution && tx.method !== "cartao" ? (
                       <span className="badge">{tx.institution}</span>
@@ -636,6 +892,7 @@ export function Lancamentos() {
                   </div>
 
                   <button
+                    type="button"
                     className="btn-secondary"
                     onClick={async () => {
                       try {
@@ -659,6 +916,7 @@ export function Lancamentos() {
                   </button>
 
                   <button
+                    type="button"
                     className="btn-secondary"
                     onClick={() => setEditing(tx)}
                   >
@@ -691,10 +949,39 @@ export function Lancamentos() {
               setToast({ kind: "error", text: "Não foi possível excluir." });
             }
           }}
-          onSave={async (patch) => {
+          onSave={async (patch, opts) => {
             try {
+              // ✅ opcional: atualizar o template da recorrência
+              if (opts?.updateRecurring && editing.fixedBillId) {
+                const dueDay =
+                  patch.method === "cartao"
+                    ? dayFromISO(patch.date ?? editing.date)
+                    : patch.dueDate
+                    ? dayFromISO(patch.dueDate)
+                    : dayFromISO(patch.date ?? editing.date);
+
+                await db.fixedBills.update(editing.fixedBillId, {
+                  name: (patch.description ?? editing.description).trim(),
+                  type: (patch.type ?? editing.type) as any,
+                  method: (patch.method ?? editing.method) as any,
+                  amountCents: patch.amountCents ?? editing.amountCents,
+                  categoryId: patch.categoryId ?? editing.categoryId,
+                  notes: patch.notes ?? editing.notes ?? "",
+                  dueDay,
+                  institution:
+                    (patch.method ?? editing.method) === "cartao"
+                      ? undefined
+                      : patch.institution ?? editing.institution,
+                  cardId:
+                    (patch.method ?? editing.method) === "cartao"
+                      ? patch.cardId ?? editing.cardId
+                      : undefined,
+                  active: true,
+                });
+              }
+
               await updateTransaction(editing.id, patch);
-              setEditing(null); // ✅ fecha no sucesso
+              setEditing(null);
               setToast({
                 kind: "success",
                 text: "Lançamento atualizado com sucesso.",
@@ -704,7 +991,7 @@ export function Lancamentos() {
                 kind: "error",
                 text: "Não foi possível salvar as alterações.",
               });
-              throw new Error("save_failed"); // permite o modal mostrar erro se quiser
+              throw new Error("save_failed");
             }
           }}
         />
@@ -719,7 +1006,10 @@ function EditModal(props: {
   cards: Array<{ id: string; name: string }>;
   onClose: () => void;
   onDelete: () => Promise<void>;
-  onSave: (patch: TxPatch) => Promise<void>;
+  onSave: (
+    patch: TxPatch,
+    opts?: { updateRecurring?: boolean }
+  ) => Promise<void>;
 }) {
   const idBase = useId();
 
@@ -736,6 +1026,7 @@ function EditModal(props: {
     cardId: props.tx.cardId ?? "",
     dueDate: props.tx.dueDate ?? "",
     notes: props.tx.notes ?? "",
+    updateRecurring: false, // ✅ opcional: aplicar ao “template” também
   }));
 
   const [saving, setSaving] = useState(false);
@@ -747,6 +1038,7 @@ function EditModal(props: {
     local.method !== "cartao" && local.type !== "transferencia";
 
   const amountCents = useMemo(() => brlToCents(local.amount), [local.amount]);
+
   const canSave =
     !!amountCents &&
     amountCents > 0 &&
@@ -765,10 +1057,12 @@ function EditModal(props: {
               recalculados pelo serviço ao mudar data/cartão.
             </div>
           </div>
+
           <button
             className="btn-secondary"
             onClick={props.onClose}
             disabled={saving}
+            type="button"
           >
             Fechar
           </button>
@@ -1043,10 +1337,32 @@ function EditModal(props: {
               aria-label="Observações"
             />
           </div>
+
+          {props.tx.fixedBillId ? (
+            <div className="md:col-span-6">
+              <label className="inline-flex items-center gap-2 text-sm text-slate-200">
+                <input
+                  type="checkbox"
+                  checked={local.updateRecurring}
+                  onChange={(e) =>
+                    setLocal((s) => ({
+                      ...s,
+                      updateRecurring: e.target.checked,
+                    }))
+                  }
+                />
+                Aplicar estas mudanças também na recorrência (próximos meses)
+              </label>
+              <div className="text-xs text-slate-400 mt-1">
+                Isso atualiza a “Conta fixa” vinculada a este lançamento.
+              </div>
+            </div>
+          ) : null}
         </div>
 
         <div className="flex flex-col md:flex-row gap-2 md:items-center md:justify-between mt-4">
           <button
+            type="button"
             className="btn-secondary"
             disabled={saving}
             onClick={async () => {
@@ -1064,6 +1380,7 @@ function EditModal(props: {
 
           <div className="flex gap-2 justify-end">
             <button
+              type="button"
               className="btn-secondary"
               onClick={props.onClose}
               disabled={saving}
@@ -1072,11 +1389,13 @@ function EditModal(props: {
             </button>
 
             <button
+              type="button"
               className="btn"
               disabled={!canSave || saving}
               onClick={async () => {
                 setErrorMsg(null);
                 setSaving(true);
+
                 try {
                   const patch: TxPatch = {
                     refMonth: local.refMonth,
@@ -1096,8 +1415,10 @@ function EditModal(props: {
                       : undefined,
                     notes: local.notes,
                   };
-                  await props.onSave(patch);
-                  // ✅ no sucesso, o parent fecha (setEditing(null))
+
+                  await props.onSave(patch, {
+                    updateRecurring: local.updateRecurring,
+                  });
                 } catch {
                   setSaving(false);
                   setErrorMsg("Falha ao salvar. Tente novamente.");
